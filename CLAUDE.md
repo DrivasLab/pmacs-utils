@@ -15,9 +15,10 @@ Toolkit for streamlined PMACS cluster access via split-tunnel VPN.
 **Native GlobalProtect implementation** - no OpenConnect dependency.
 
 - Direct GlobalProtect protocol (SSL tunnel mode)
-- Cross-platform TUN device via `tun-rs` crate
+- Cross-platform TUN device via `tun` crate (0.6)
 - Split-tunnel routing for specified hosts only
 - DUO MFA support (server-side RADIUS, we just send "push")
+- TLS via rustls (ring crypto backend, no cmake required)
 
 **Language:** Rust (single binary, cross-compiles)
 
@@ -45,15 +46,19 @@ pmacs-vpn disconnect
 
 ## Current Status
 
+**Implementation Complete - Ready for Testing**
+
 - [x] Rust project scaffold with CLI
 - [x] Platform routing managers (mac/linux/windows)
 - [x] Hosts file management
 - [x] State persistence
-- [x] 41 unit tests passing
-- [ ] **Native GlobalProtect auth module** ← IN PROGRESS
-- [ ] **SSL tunnel implementation**
-- [ ] **TUN device integration**
-- [ ] CLI wiring
+- [x] Native GlobalProtect auth module
+- [x] SSL tunnel implementation
+- [x] TUN device integration
+- [x] CLI wiring (connect/disconnect)
+- [x] 54 unit tests passing
+- [x] Clippy clean (no warnings)
+- [ ] **Integration testing with real VPN** ← NEXT
 
 ## Architecture
 

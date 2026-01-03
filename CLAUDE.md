@@ -1,47 +1,68 @@
 # PMACS Utils
 
-Cross-platform toolkit to bypass PMACS full-tunnel VPN using Docker.
+Native VPN bypass toolkit for PMACS cluster access.
 
-## Project Overview
+## Project Goal
 
-This repo provides a Docker-based workaround for PMACS's GlobalProtect VPN. Instead of routing all traffic through the VPN (full tunnel), we run the VPN in a container and expose SOCKS5/HTTP proxies. Users configure SSH to use the proxy for PMACS hosts only.
+Replace PMACS's full-tunnel GlobalProtect VPN with a lightweight split-tunnel approach using OpenConnect + vpn-slice. Only PMACS traffic goes through VPN; everything else stays on normal internet.
 
 ## Architecture
 
 ```
-Local Machine                    Docker Container
-─────────────────────────────────────────────────────
-Browser/Apps → Normal internet
-SSH prometheus → SOCKS5 proxy (8889) → OpenConnect VPN → PMACS
+openconnect (VPN client)
+    └── vpn-slice (split-tunnel routing)
+        └── Routes only PMACS hosts/subnets through VPN
+        └── Manages /etc/hosts entries
+        └── Cleans up on disconnect
 ```
 
-## Key Files
+## Key Technical Details
 
-| File | Purpose |
-|------|---------|
-| `docker-compose.yml` | OpenConnect container config |
-| `.env.example` | Credentials template (user copies to `.env`) |
-| `scripts/*.sh` | Bash scripts (Mac/Linux) |
-| `scripts/*.ps1` | PowerShell scripts (Windows) |
-| `ssh/config.example` | SSH ProxyCommand config |
-| `docs/` | Platform-specific setup guides |
+### VPN Connection
+- Gateway: `psomvpn.uphs.upenn.edu`
+- Protocol: GlobalProtect (`--protocol=gp`)
+- Auth: Password + DUO push (type "push" when prompted for passcode)
+- DUO timeout is quick — users need to approve promptly
+
+### Split Tunneling
+vpn-slice replaces OpenConnect's default vpnc-script. Instead of routing all traffic through VPN, it only routes specified hosts/subnets.
+
+Example command:
+```bash
+sudo openconnect psomvpn.uphs.upenn.edu --protocol=gp -u USERNAME \
+  -s 'vpn-slice prometheus.pmacs.upenn.edu'
+```
+
+### SSH Access
+- Host: `prometheus.pmacs.upenn.edu`
+- Requires VPN to be connected
+- SSH key + DUO push for each login (even with keys, DUO is required)
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `setup.sh` | Install deps, configure SSH, generate SSH key, test connection |
+| `connect.sh` | Start VPN with split tunneling |
+| `disconnect.sh` | Stop VPN cleanly |
+
+## Config Storage
+
+User config stored in `~/.config/pmacs/config`:
+```
+PMACS_USER=username
+```
+
+Password is prompted each time (or optionally stored in macOS Keychain).
 
 ## Development Notes
 
-- Uses [wazum/openconnect-proxy](https://github.com/wazum/openconnect-proxy) Docker image
-- OpenConnect with `--protocol=gp` for GlobalProtect
-- DUO MFA handled via `OPENCONNECT_MFA_CODE=push`
-- Proxy ports bound to localhost only (127.0.0.1) for security
-
-## Testing Checklist
-
-Before releases, verify on:
-- [ ] macOS with Docker Desktop
-- [ ] Windows with Docker Desktop (WSL2 backend)
-- [ ] Linux with native Docker
+- Mac-first development, Windows support via WSL later
+- Scripts should work on Linux with minimal changes
+- vpn-slice requires Python 3
 
 ## Common Issues
 
-- **Line endings**: `.gitattributes` handles this, but if scripts fail on Mac, run `dos2unix scripts/*.sh`
-- **netcat versions**: BSD vs GNU netcat - Mac users need `brew install netcat`
-- **DUO timing**: Container may timeout waiting for push; user needs to approve quickly
+- **DUO timeout**: OpenConnect waits for DUO approval; if user is slow, it times out
+- **vpn-slice not found**: Needs `sudo pip3 install vpn-slice`
+- **Permission denied**: OpenConnect requires sudo for tunnel creation

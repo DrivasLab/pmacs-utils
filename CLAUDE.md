@@ -72,8 +72,11 @@ pmacs-vpn init
 - [x] SSL tunnel with async TUN I/O
 - [x] Split-tunnel routing
 - [x] Credential caching (Windows Credential Manager)
-- [x] Desktop shortcut workflow
-- [x] 61 unit tests, clippy clean
+- [x] Daemon mode (--daemon flag)
+- [x] System tray GUI (pmacs-vpn tray)
+- [x] Upfront admin privilege check
+- [x] Desktop shortcut workflow (tray.ps1, connect.ps1)
+- [x] 70 unit tests, clippy clean
 - [x] **SSH to prometheus works!**
 - [ ] macOS testing
 - [ ] Linux testing
@@ -84,10 +87,11 @@ See [TODO.md](TODO.md) for improvement roadmap.
 
 ```
 src/
-├── main.rs          # CLI
+├── main.rs          # CLI + daemon spawn logic
 ├── config.rs        # TOML config
 ├── credentials.rs   # OS keychain (Windows Credential Manager)
-├── state.rs         # Connection state persistence
+├── state.rs         # Connection state + auth token persistence
+├── tray.rs          # System tray GUI
 ├── gp/              # GlobalProtect protocol
 │   ├── auth.rs      # prelogin → login → getconfig
 │   ├── tunnel.rs    # SSL tunnel + async event loop

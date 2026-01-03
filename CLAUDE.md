@@ -5,42 +5,96 @@ Toolkit for streamlined PMACS cluster access via split-tunnel VPN.
 ## Design Principles
 
 1. **UX first** - "Just works" for non-technical users
-2. **Cross-platform** - Mac first, then Windows/Linux
-3. **No hardcoding** - Config-driven
+2. **Cross-platform** - Windows, Mac, Linux from single codebase
+3. **Zero dependencies** - Single binary (+ wintun.dll on Windows)
 4. **Lightweight for users** - Our code can be robust; user RAM is precious
 5. **Best practices** - Error handling, clear messages, defensive coding
 
 ## Technical Approach
 
-**Split-tunnel VPN** using OpenConnect + custom routing logic (inspired by vpn-slice).
+**Native GlobalProtect implementation** - no OpenConnect dependency.
 
-- OpenConnect connects to GlobalProtect (`psomvpn.uphs.upenn.edu`)
-- Our routing module adds routes only for specified hosts (e.g., `prometheus.pmacs.upenn.edu`)
-- Everything else uses normal internet
+- Direct GlobalProtect protocol (SSL tunnel mode)
+- Cross-platform TUN device via `tun-rs` crate
+- Split-tunnel routing for specified hosts only
+- DUO MFA support (server-side RADIUS, we just send "push")
 
-**Language:** Rust (single binary, cross-compiles to Mac/Windows/Linux)
+**Language:** Rust (single binary, cross-compiles)
 
 ## Knowledge Base
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/pmacs-environment.md](docs/pmacs-environment.md) | PMACS hosts, VPN details, SSH config |
-| [docs/vpn-slice-analysis.md](docs/vpn-slice-analysis.md) | How vpn-slice works, what we need |
-| [docs/rust-claude-guide.md](docs/rust-claude-guide.md) | Rust development best practices with Claude |
+| [docs/native-gp-implementation-plan.md](docs/native-gp-implementation-plan.md) | **Implementation spec** |
+| [docs/pmacs-environment.md](docs/pmacs-environment.md) | PMACS hosts, VPN details |
+| [docs/rust-claude-guide.md](docs/rust-claude-guide.md) | Rust dev practices |
+| [docs/vpn-slice-analysis.md](docs/vpn-slice-analysis.md) | Routing/hosts approach |
 
-## Quick Reference
+## Target UX
 
 ```bash
-# Manual test (working)
-sudo openconnect psomvpn.uphs.upenn.edu --protocol=gp -u USERNAME \
-  -s 'vpn-slice prometheus.pmacs.upenn.edu'
+# Connect (prompts for password, sends DUO push)
+pmacs-vpn connect -u USERNAME
 
-# Then in another terminal
-ssh prometheus.pmacs.upenn.edu
+# Check status
+pmacs-vpn status
+
+# Disconnect
+pmacs-vpn disconnect
 ```
 
 ## Current Status
 
-- [x] Validated split-tunnel approach works
-- [x] Analyzed vpn-slice source
-- [ ] Implement Python toolkit
+- [x] Rust project scaffold with CLI
+- [x] Platform routing managers (mac/linux/windows)
+- [x] Hosts file management
+- [x] State persistence
+- [x] 41 unit tests passing
+- [ ] **Native GlobalProtect auth module** ← IN PROGRESS
+- [ ] **SSL tunnel implementation**
+- [ ] **TUN device integration**
+- [ ] CLI wiring
+
+## Architecture
+
+```
+src/
+├── main.rs          # CLI
+├── config.rs        # TOML config
+├── state.rs         # Connection state persistence
+├── gp/              # GlobalProtect protocol (NEW)
+│   ├── auth.rs      # prelogin → login → getconfig
+│   ├── tunnel.rs    # SSL tunnel
+│   ├── tun.rs       # TUN device wrapper
+│   └── packet.rs    # Packet framing
+├── platform/        # OS-specific routing
+│   ├── mac.rs
+│   ├── linux.rs
+│   └── windows.rs
+└── vpn/
+    ├── routing.rs   # DNS + route management
+    └── hosts.rs     # /etc/hosts management
+```
+
+## Development
+
+```bash
+# Build
+cargo build
+
+# Test
+cargo test
+
+# Lint
+cargo clippy -- -D warnings
+
+# Build release
+cargo build --release
+```
+
+## Gateway Details
+
+- **URL:** `psomvpn.uphs.upenn.edu`
+- **Protocol:** GlobalProtect (SSL tunnel mode)
+- **Auth:** Password + DUO push
+- **Target hosts:** `prometheus.pmacs.upenn.edu` (and others in config)

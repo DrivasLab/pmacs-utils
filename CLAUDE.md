@@ -103,3 +103,17 @@ cargo build --release
 - **Protocol:** GlobalProtect (SSL tunnel mode)
 - **Auth:** Password + DUO push
 - **Target hosts:** `prometheus.pmacs.upenn.edu` (and others in config)
+
+## Windows: wintun.dll
+
+The binary embeds `wintun.dll` (~420KB) from [wintun.net](https://www.wintun.net/). On first TUN device creation, it auto-extracts to the executable's directory. No manual installation needed.
+
+## Testing (requires admin/root)
+
+```bash
+cargo build --release
+sudo ./target/release/pmacs-vpn connect -u YOUR_USERNAME
+# Enter password, approve DUO push on phone
+# In another terminal: ssh prometheus.pmacs.upenn.edu
+# Ctrl+C to disconnect
+```

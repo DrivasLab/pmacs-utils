@@ -6,6 +6,7 @@ use pmacs_vpn::AuthToken;
 use pmacs_vpn::notifications;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{error, info, warn, Level};
@@ -73,6 +74,28 @@ enum Commands {
         #[arg(long, hide = true)]
         _daemon_pid: Option<u32>,
     },
+    /// Run a command while VPN is connected, then disconnect
+    Run {
+        /// Username for VPN authentication
+        #[arg(short, long)]
+        user: Option<String>,
+
+        /// Store password in system keychain after successful login
+        #[arg(short = 's', long)]
+        save_password: bool,
+
+        /// Delete stored password before prompting
+        #[arg(short = 'f', long)]
+        forget_password: bool,
+
+        /// Use aggressive keepalive to prevent idle timeout (10s instead of 30s)
+        #[arg(short = 'k', long)]
+        keep_alive: bool,
+
+        /// Command to run after VPN connects (use -- to separate)
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
     /// Disconnect from VPN and clean up routes
     Disconnect,
     /// Show current VPN status
@@ -106,7 +129,7 @@ fn is_admin() -> bool {
 fn requires_admin(cmd: &Commands) -> bool {
     match cmd {
         // Connect/Disconnect require root on all platforms (TUN device, routes, /etc/hosts)
-        Commands::Connect { .. } | Commands::Disconnect => true,
+        Commands::Connect { .. } | Commands::Run { .. } | Commands::Disconnect => true,
 
         // On Windows, tray needs admin upfront (spawns daemon directly)
         #[cfg(windows)]
@@ -219,6 +242,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Run { user, save_password, forget_password, keep_alive, command } => {
+            let command_display = command.join(" ");
+            println!("Starting VPN for command: {}", command_display);
+
+            let pid = match spawn_daemon(&user, save_password, forget_password, keep_alive).await {
+                Ok(pid) => pid,
+                Err(e) => {
+                    error!("Failed to start VPN: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            let ready_timeout = Duration::from_secs(30);
+            if let Err(e) = wait_for_vpn_ready(pid, ready_timeout).await {
+                error!("VPN did not become ready: {}", e);
+                let _ = disconnect_vpn().await;
+                std::process::exit(1);
+            }
+
+            println!("VPN ready. Running command: {}", command_display);
+            let status = run_command_with_signals(command).await;
+
+            info!("Command finished, disconnecting VPN...");
+            if let Err(e) = disconnect_vpn().await {
+                error!("Failed to disconnect VPN: {}", e);
+            }
+
+            match status {
+                Ok(status) => {
+                    if let Some(code) = status.code() {
+                        std::process::exit(code);
+                    } else {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    error!("Command failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::Disconnect => {
             info!("Disconnecting from PMACS VPN...");
             match disconnect_vpn().await {
@@ -236,13 +300,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match pmacs_vpn::VpnState::load() {
                     Ok(Some(state)) => {
                         // If we have a daemon PID, treat stale PID as disconnected.
-                        if let Some(pid) = state.pid {
-                            if !state.is_daemon_running() {
-                                println!("VPN Status: Not connected");
-                                println!("  Note: Found stale state (PID {} is not running)", pid);
-                                println!("  Cleanup: Run 'sudo pmacs-vpn disconnect' to remove stale routes/hosts");
-                                return Ok(());
-                            }
+                        if let Some(pid) = state.pid
+                            && !state.is_daemon_running()
+                        {
+                            println!("VPN Status: Not connected");
+                            println!("  Note: Found stale state (PID {} is not running)", pid);
+                            println!("  Cleanup: Run 'sudo pmacs-vpn disconnect' to remove stale routes/hosts");
+                            return Ok(());
                         }
 
                         // Connected (or foreground state without PID)
@@ -346,10 +410,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Cleanup VPN when tray exits (called on Ctrl+C or normal exit)
 fn cleanup_vpn_on_exit() {
     // Kill daemon if running
-    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-        if state.pid.is_some() && state.is_daemon_running() {
-            let _ = state.kill_daemon();
-        }
+    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+        && state.pid.is_some()
+        && state.is_daemon_running()
+    {
+        let _ = state.kill_daemon();
     }
     // Best-effort route/hosts cleanup (sync version)
     let _ = std::process::Command::new(std::env::current_exe().unwrap())
@@ -450,15 +515,15 @@ async fn run_tray_mode() {
                             let mut connected = false;
                             for _ in 0..60 {  // max 30 seconds (DUO + TUN setup can be slow)
                                 std::thread::sleep(std::time::Duration::from_millis(500));
-                                if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                                    if state.is_daemon_running() {
-                                        notifications::notify_connected();
-                                        let _ = status_tx_clone.send(VpnStatus::Connected {
-                                            ip: state.gateway.to_string(),
-                                        });
-                                        connected = true;
-                                        break;
-                                    }
+                                if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                                    && state.is_daemon_running()
+                                {
+                                    notifications::notify_connected();
+                                    let _ = status_tx_clone.send(VpnStatus::Connected {
+                                        ip: state.gateway.to_string(),
+                                    });
+                                    connected = true;
+                                    break;
                                 }
                             }
                             if !connected {
@@ -478,10 +543,11 @@ async fn run_tray_mode() {
                     let _ = status_tx_clone.send(VpnStatus::Disconnecting);
 
                     // Kill daemon and cleanup
-                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                        if state.pid.is_some() && state.is_daemon_running() {
-                            let _ = state.kill_daemon();
-                        }
+                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                        && state.pid.is_some()
+                        && state.is_daemon_running()
+                    {
+                        let _ = state.kill_daemon();
                     }
 
                     // Cleanup routes and hosts
@@ -539,10 +605,11 @@ async fn run_tray_mode() {
                     let _ = status_tx_clone.send(VpnStatus::Connecting);
 
                     // Kill existing daemon if running
-                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                        if state.pid.is_some() && state.is_daemon_running() {
-                            let _ = state.kill_daemon();
-                        }
+                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                        && state.pid.is_some()
+                        && state.is_daemon_running()
+                    {
+                        let _ = state.kill_daemon();
                     }
 
                     // Cleanup routes and hosts
@@ -573,15 +640,15 @@ async fn run_tray_mode() {
                             let mut connected = false;
                             for _ in 0..60 {
                                 std::thread::sleep(std::time::Duration::from_millis(500));
-                                if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                                    if state.is_daemon_running() {
-                                        notifications::notify_connected();
-                                        let _ = status_tx_clone.send(VpnStatus::Connected {
-                                            ip: state.gateway.to_string(),
-                                        });
-                                        connected = true;
-                                        break;
-                                    }
+                                if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                                    && state.is_daemon_running()
+                                {
+                                    notifications::notify_connected();
+                                    let _ = status_tx_clone.send(VpnStatus::Connected {
+                                        ip: state.gateway.to_string(),
+                                    });
+                                    connected = true;
+                                    break;
                                 }
                             }
                             if !connected {
@@ -662,12 +729,12 @@ async fn run_tray_mode() {
     });
 
     // Check initial VPN state
-    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-        if state.is_daemon_running() {
-            let _ = status_tx.send(VpnStatus::Connected {
-                ip: state.gateway.to_string(),
-            });
-        }
+    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+        && state.is_daemon_running()
+    {
+        let _ = status_tx.send(VpnStatus::Connected {
+            ip: state.gateway.to_string(),
+        });
     }
 
     // Spawn health monitor to detect daemon death and trigger auto-reconnect
@@ -693,48 +760,48 @@ async fn run_tray_mode() {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-            if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                if state.pid.is_some() {
-                    if state.is_daemon_running() {
-                        WAS_CONNECTED.store(true, Ordering::Relaxed);
-                        RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed); // Reset on successful connection
-                    } else if WAS_CONNECTED.swap(false, Ordering::Relaxed) {
-                        // Daemon died unexpectedly (was connected, now dead)
-                        let current_attempt = RECONNECT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+            if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                && state.pid.is_some()
+            {
+                if state.is_daemon_running() {
+                    WAS_CONNECTED.store(true, Ordering::Relaxed);
+                    RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed); // Reset on successful connection
+                } else if WAS_CONNECTED.swap(false, Ordering::Relaxed) {
+                    // Daemon died unexpectedly (was connected, now dead)
+                    let current_attempt = RECONNECT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
 
-                        if auto_reconnect_enabled && current_attempt < max_attempts {
-                            info!(
-                                "Health monitor: Daemon died, attempting reconnect ({}/{})",
-                                current_attempt + 1,
-                                max_attempts
-                            );
+                    if auto_reconnect_enabled && current_attempt < max_attempts {
+                        info!(
+                            "Health monitor: Daemon died, attempting reconnect ({}/{})",
+                            current_attempt + 1,
+                            max_attempts
+                        );
 
-                            // Calculate backoff delay: base * 2^attempt (capped at 60s)
-                            let delay = std::cmp::min(base_delay * (1 << current_attempt), 60);
+                        // Calculate backoff delay: base * 2^attempt (capped at 60s)
+                        let delay = std::cmp::min(base_delay * (1 << current_attempt), 60);
 
-                            notifications::notify_reconnecting(current_attempt + 1, max_attempts);
-                            let _ = status_tx_health.send(VpnStatus::Reconnecting {
-                                attempt: current_attempt + 1,
-                                max_attempts,
-                            });
+                        notifications::notify_reconnecting(current_attempt + 1, max_attempts);
+                        let _ = status_tx_health.send(VpnStatus::Reconnecting {
+                            attempt: current_attempt + 1,
+                            max_attempts,
+                        });
 
-                            // Wait with backoff before reconnecting
-                            tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
+                        // Wait with backoff before reconnecting
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay as u64)).await;
 
-                            // Trigger reconnect via command channel
-                            let _ = command_tx_health.send(TrayCommand::AutoReconnect {
-                                attempt: current_attempt + 1,
-                            });
+                        // Trigger reconnect via command channel
+                        let _ = command_tx_health.send(TrayCommand::AutoReconnect {
+                            attempt: current_attempt + 1,
+                        });
+                    } else {
+                        info!("Health monitor: Daemon died, max reconnect attempts reached or disabled");
+                        if auto_reconnect_enabled {
+                            notifications::notify_reconnect_failed();
                         } else {
-                            info!("Health monitor: Daemon died, max reconnect attempts reached or disabled");
-                            if auto_reconnect_enabled {
-                                notifications::notify_reconnect_failed();
-                            } else {
-                                notifications::notify_unexpected_disconnect();
-                            }
-                            let _ = status_tx_health.send(VpnStatus::Disconnected);
-                            RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed);
+                            notifications::notify_unexpected_disconnect();
                         }
+                        let _ = status_tx_health.send(VpnStatus::Disconnected);
+                        RECONNECT_ATTEMPTS.store(0, Ordering::Relaxed);
                     }
                 }
             }
@@ -862,10 +929,11 @@ fn run_tray_mode_sync() {
                     info!("Tray: Received disconnect command");
                     let _ = status_tx_clone.send(VpnStatus::Disconnecting);
 
-                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                        if state.pid.is_some() && state.is_daemon_running() {
-                            let _ = state.kill_daemon();
-                        }
+                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                        && state.pid.is_some()
+                        && state.is_daemon_running()
+                    {
+                        let _ = state.kill_daemon();
                     }
 
                     // Note: cleanup requires sudo on macOS, but we at least kill the daemon
@@ -890,10 +958,11 @@ fn run_tray_mode_sync() {
                 }
                 TrayCommand::Exit => {
                     info!("Tray: Exit requested");
-                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                        if state.pid.is_some() && state.is_daemon_running() {
-                            let _ = state.kill_daemon();
-                        }
+                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                        && state.pid.is_some()
+                        && state.is_daemon_running()
+                    {
+                        let _ = state.kill_daemon();
                     }
                     break;
                 }
@@ -908,12 +977,12 @@ fn run_tray_mode_sync() {
     });
 
     // Check initial state
-    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-        if state.is_daemon_running() {
-            let _ = status_tx.send(VpnStatus::Connected {
-                ip: state.gateway.to_string(),
-            });
-        }
+    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+        && state.is_daemon_running()
+    {
+        let _ = status_tx.send(VpnStatus::Connected {
+            ip: state.gateway.to_string(),
+        });
     }
 
     // Spawn health monitor
@@ -924,15 +993,15 @@ fn run_tray_mode_sync() {
 
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                if state.pid.is_some() {
-                    if state.is_daemon_running() {
-                        WAS_CONNECTED.store(true, Ordering::Relaxed);
-                    } else if WAS_CONNECTED.swap(false, Ordering::Relaxed) {
-                        info!("Health monitor: Daemon died unexpectedly");
-                        notifications::notify_error("VPN disconnected unexpectedly");
-                        let _ = status_tx_health.send(VpnStatus::Disconnected);
-                    }
+            if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                && state.pid.is_some()
+            {
+                if state.is_daemon_running() {
+                    WAS_CONNECTED.store(true, Ordering::Relaxed);
+                } else if WAS_CONNECTED.swap(false, Ordering::Relaxed) {
+                    info!("Health monitor: Daemon died unexpectedly");
+                    notifications::notify_error("VPN disconnected unexpectedly");
+                    let _ = status_tx_health.send(VpnStatus::Disconnected);
                 }
             }
         }
@@ -1112,6 +1181,167 @@ async fn spawn_daemon(
     let pid = child.id();
 
     Ok(pid)
+}
+
+/// Wait for the VPN daemon to be ready (state saved and PID running)
+async fn wait_for_vpn_ready(expected_pid: u32, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+
+    loop {
+        if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+            && state.pid == Some(expected_pid)
+            && state.is_daemon_running()
+        {
+            return Ok(());
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "Timed out after {}s waiting for VPN to connect",
+                timeout.as_secs()
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Run a command and handle signals gracefully
+async fn run_command_with_signals(
+    command: Vec<String>,
+) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
+    let mut cmd = build_run_command(&command)?;
+    let mut child = cmd.spawn()?;
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sighup = signal(SignalKind::hangup())?;
+
+        tokio::select! {
+            status = child.wait() => status.map_err(|e| e.into()),
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received interrupt, stopping command...");
+                terminate_child(&mut child, nix::sys::signal::Signal::SIGINT).await;
+                wait_for_child_exit(&mut child).await
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, stopping command...");
+                terminate_child(&mut child, nix::sys::signal::Signal::SIGTERM).await;
+                wait_for_child_exit(&mut child).await
+            }
+            _ = sighup.recv() => {
+                info!("Received SIGHUP, stopping command...");
+                terminate_child(&mut child, nix::sys::signal::Signal::SIGHUP).await;
+                wait_for_child_exit(&mut child).await
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            status = child.wait() => status.map_err(|e| e.into()),
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received interrupt, stopping command...");
+                let _ = child.kill().await;
+                child.wait().await.map_err(|e| e.into())
+            }
+        }
+    }
+}
+
+fn build_run_command(command: &[String]) -> Result<tokio::process::Command, String> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| "No command provided".to_string())?;
+
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+
+    #[cfg(unix)]
+    {
+        apply_sudo_user(&mut cmd);
+    }
+
+    Ok(cmd)
+}
+
+#[cfg(unix)]
+fn apply_sudo_user(cmd: &mut tokio::process::Command) {
+    if !is_admin() {
+        return;
+    }
+
+    let sudo_uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    let sudo_gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+
+    if let (Some(uid), Some(gid)) = (sudo_uid, sudo_gid) {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().uid(uid);
+        cmd.as_std_mut().gid(gid);
+    }
+
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        cmd.env("USER", &sudo_user);
+        cmd.env("LOGNAME", &sudo_user);
+        if let Ok(Some(user)) = nix::unistd::User::from_name(&sudo_user) {
+            cmd.env("HOME", user.dir);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(sock) = macos_ssh_auth_sock() {
+        cmd.env("SSH_AUTH_SOCK", sock);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_ssh_auth_sock() -> Option<String> {
+    use std::process::Command;
+
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())?;
+
+    let output = Command::new("/bin/launchctl")
+        .args(["asuser", &uid.to_string(), "launchctl", "getenv", "SSH_AUTH_SOCK"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+async fn wait_for_child_exit(
+    child: &mut tokio::process::Child,
+) -> Result<std::process::ExitStatus, Box<dyn std::error::Error>> {
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(status) => status.map_err(|e| e.into()),
+        Err(_) => {
+            let _ = child.kill().await;
+            child.wait().await.map_err(|e| e.into())
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_child(child: &mut tokio::process::Child, signal: nix::sys::signal::Signal) {
+    if let Some(pid) = child.id() {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal);
+    }
 }
 
 /// Prompt for input with optional default value
@@ -1466,12 +1696,12 @@ async fn connect_vpn(user: Option<String>, save_password: bool, forget_password:
     #[cfg(target_os = "macos")]
     {
         // Check if Touch ID for sudo is configured
-        if let Ok(pam_sudo) = std::fs::read_to_string("/etc/pam.d/sudo") {
-            if !pam_sudo.contains("pam_tid.so") {
-                println!();
-                println!("TIP: Enable Touch ID for sudo to skip password prompts.");
-                println!("     See README.md for instructions.");
-            }
+        if let Ok(pam_sudo) = std::fs::read_to_string("/etc/pam.d/sudo")
+            && !pam_sudo.contains("pam_tid.so")
+        {
+            println!();
+            println!("TIP: Enable Touch ID for sudo to skip password prompts.");
+            println!("     See README.md for instructions.");
         }
     }
 

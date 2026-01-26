@@ -46,6 +46,15 @@ pmacs-vpn status                      # check if connected
 sudo pmacs-vpn disconnect             # stop
 ```
 
+### Run a command and auto-disconnect on exit.
+
+```bash
+sudo pmacs-vpn run -- ssh <user>@<host>
+```
+
+- `--` passes flags through to the command
+- Shell aliases won't apply inside the command but you can alias the entire command.
+
 **Keychain popup asking for password:** Click "Always Allow" so it doesn't ask again.
 
 ### Set up SSH keys for automatic connection:

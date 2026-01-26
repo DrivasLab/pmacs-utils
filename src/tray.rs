@@ -284,11 +284,12 @@ impl TrayApp {
 
                         // Kill daemon synchronously before exiting
                         // (can't rely on async handler - event loop exits immediately)
-                        if let Ok(Some(state)) = crate::VpnState::load() {
-                            if state.pid.is_some() && state.is_daemon_running() {
-                                info!("Killing VPN daemon before exit");
-                                let _ = state.kill_daemon();
-                            }
+                        if let Ok(Some(state)) = crate::VpnState::load()
+                            && state.pid.is_some()
+                            && state.is_daemon_running()
+                        {
+                            info!("Killing VPN daemon before exit");
+                            let _ = state.kill_daemon();
                         }
 
                         let _ = command_tx.send(TrayCommand::Exit);

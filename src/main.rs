@@ -667,10 +667,10 @@ async fn run_tray_mode() {
                     info!("Tray: Auto-reconnect attempt {}", attempt);
 
                     // Cleanup stale state
-                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                        if state.pid.is_some() {
-                            let _ = state.kill_daemon();
-                        }
+                    if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                        && state.pid.is_some()
+                    {
+                        let _ = state.kill_daemon();
                     }
                     let _ = rt.block_on(disconnect_vpn());
 
@@ -701,15 +701,15 @@ async fn run_tray_mode() {
                             let mut connected = false;
                             for _ in 0..60 {
                                 std::thread::sleep(std::time::Duration::from_millis(500));
-                                if let Ok(Some(state)) = pmacs_vpn::VpnState::load() {
-                                    if state.is_daemon_running() {
-                                        notifications::notify_connected();
-                                        let _ = status_tx_clone.send(VpnStatus::Connected {
-                                            ip: state.gateway.to_string(),
-                                        });
-                                        connected = true;
-                                        break;
-                                    }
+                                if let Ok(Some(state)) = pmacs_vpn::VpnState::load()
+                                    && state.is_daemon_running()
+                                {
+                                    notifications::notify_connected();
+                                    let _ = status_tx_clone.send(VpnStatus::Connected {
+                                        ip: state.gateway.to_string(),
+                                    });
+                                    connected = true;
+                                    break;
                                 }
                             }
                             if !connected {
